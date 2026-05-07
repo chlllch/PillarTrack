@@ -1,9 +1,38 @@
 import argparse
 import datetime
 import glob
+import importlib
 import os
+import sys
 from pathlib import Path
-from test_track import repeat_eval_ckpt
+
+
+def _enforce_local_pillartrack():
+    """Ensure this script always uses the local repository package."""
+    repo_root = Path(__file__).resolve().parents[1]
+    local_pkg_dir = repo_root / 'pillartrack'
+    if not local_pkg_dir.is_dir():
+        raise RuntimeError(f'Local pillartrack package not found: {local_pkg_dir}')
+
+    repo_root_str = str(repo_root)
+    sys.path = [p for p in sys.path if p != repo_root_str]
+    sys.path.insert(0, repo_root_str)
+
+    # Remove previously loaded pillartrack modules to avoid stale imports.
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == 'pillartrack' or mod_name.startswith('pillartrack.'):
+            sys.modules.pop(mod_name, None)
+
+    config_module = importlib.import_module('pillartrack.config')
+    config_file = Path(config_module.__file__).resolve()
+    if local_pkg_dir not in config_file.parents:
+        raise RuntimeError(
+            f'Environment conflict: pillartrack.config was loaded from {config_file}, '
+            f'expected path under {local_pkg_dir}'
+        )
+
+
+_enforce_local_pillartrack()
 
 import torch
 import torch.distributed as dist
@@ -17,6 +46,22 @@ from pillartrack.models import build_network, model_fn_decorator
 from pillartrack.utils import common_utils
 from train_utils.optimization import build_optimizer, build_scheduler
 from train_utils.train_track_utils import train_model
+
+
+def _infer_dataset_cls(cfg_file):
+    cfg_file_lower = cfg_file.lower()
+    if 'kit' in cfg_file_lower:
+        return 'kitti'
+    if 'nus' in cfg_file_lower:
+        return 'nus'
+    return 'waymo'
+
+
+def _list_saved_ckpts(ckpt_dir):
+    ckpt_list = glob.glob(str(ckpt_dir / '*.pth'))
+    ckpt_list = [x for x in ckpt_list if not x.endswith('_optim.pth')]
+    ckpt_list.sort(key=os.path.getmtime)
+    return ckpt_list
 
 
 def parse_config():
@@ -35,6 +80,7 @@ def parse_config():
     parser.add_argument('--fix_random_seed', type=str, default=True, help='')
     parser.add_argument('--ckpt_save_interval', type=int, default=1, help='number of training epochs')
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
+    parser.add_argument('--gpu_id', type=int, default=1, help='GPU id for single-GPU training')
     parser.add_argument('--max_ckpt_save_num', type=int, default=20, help='max number of saved checkpoint')
     parser.add_argument('--merge_all_iters_to_one_epoch', action='store_true', default=False, help='')
     parser.add_argument('--set', dest='set_cfgs', default=None, nargs=argparse.REMAINDER,
@@ -61,6 +107,12 @@ def main():
     if args.launcher == 'none':
         dist_train = False
         total_gpus = 1
+        if not torch.cuda.is_available():
+            raise RuntimeError('CUDA is required for training, but no GPU is available.')
+        num_gpus = torch.cuda.device_count()
+        if args.gpu_id < 0 or args.gpu_id >= num_gpus:
+            raise ValueError(f'Invalid gpu_id={args.gpu_id}, available GPU ids are 0-{num_gpus - 1}')
+        torch.cuda.set_device(args.gpu_id)
     else:
         total_gpus, cfg.LOCAL_RANK = getattr(common_utils, 'init_dist_%s' % args.launcher)(
             args.tcp_port, args.local_rank, backend='nccl'
@@ -88,8 +140,12 @@ def main():
 
     # log to file
     logger.info('**********************Start logging**********************')
+    logger.info('CFG_ROOT_DIR=%s' % cfg.ROOT_DIR)
+    logger.info('OUTPUT_DIR=%s' % output_dir)
+    logger.info('CKPT_DIR=%s' % ckpt_dir)
     gpu_list = os.environ['CUDA_VISIBLE_DEVICES'] if 'CUDA_VISIBLE_DEVICES' in os.environ.keys() else 'ALL'
     logger.info('CUDA_VISIBLE_DEVICES=%s' % gpu_list)
+    logger.info('ACTIVE_CUDA_DEVICE=%s' % torch.cuda.current_device())
 
     if dist_train:
         logger.info('total_batch_size: %d' % (total_gpus * args.batch_size))
@@ -114,6 +170,17 @@ def main():
         merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
         total_epochs=args.epochs
     )
+
+    dataset_cls = _infer_dataset_cls(args.cfg_file)
+    _, test_loader, _ = build_dataloader(
+        dataset_cfg=cfg.DATA_CONFIG,
+        class_names=cfg.CLASS_NAMES,
+        batch_size=args.batch_size,
+        dist=dist_train, workers=args.workers,
+        logger=logger,
+        training=False,
+        eval_flag=True
+    )
     
     model = build_network(model_cfg=cfg.MODEL, num_class=len(cfg.CLASS_NAMES), dataset=train_set)
     if args.sync_bn:
@@ -132,9 +199,8 @@ def main():
         it, start_epoch = model.load_params_with_optimizer(args.ckpt, to_cpu=dist, optimizer=optimizer, logger=logger)
         last_epoch = start_epoch + 1
     else:
-        ckpt_list = glob.glob(str(ckpt_dir / '*checkpoint_epoch_*.pth'))
+        ckpt_list = _list_saved_ckpts(ckpt_dir)
         if len(ckpt_list) > 0:
-            ckpt_list.sort(key=os.path.getmtime)
             it, start_epoch = model.load_params_with_optimizer(
                 ckpt_list[-1], to_cpu=dist, optimizer=optimizer, logger=logger
             )
@@ -170,7 +236,12 @@ def main():
         lr_warmup_scheduler=lr_warmup_scheduler,
         ckpt_save_interval=args.ckpt_save_interval,
         max_ckpt_save_num=args.max_ckpt_save_num,
-        merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch
+        merge_all_iters_to_one_epoch=args.merge_all_iters_to_one_epoch,
+        test_loader=test_loader,
+        dataset_cls=dataset_cls,
+        logger=logger,
+        eval_output_dir=output_dir / 'eval',
+        save_eval_to_file=args.save_to_file
     )
         
     logger.info('**********************End training %s/%s(%s)**********************\n\n\n'

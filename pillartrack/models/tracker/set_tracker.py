@@ -9,6 +9,16 @@ from ..backbones_2d import map_to_bev
 from ..backbones_3d import pfe, vfe
 from ..model_utils import model_nms_utils
 
+
+def _get_checkpoint_map_location(to_cpu=False):
+    """
+    Map checkpoint tensors to an existing device in current process.
+    This avoids failures when checkpoints were saved on a different CUDA id.
+    """
+    if to_cpu or not torch.cuda.is_available():
+        return torch.device('cpu')
+    return torch.device(f'cuda:{torch.cuda.current_device()}')
+
 class SetTracker(nn.Module):
     def __init__(self, model_cfg, num_class, dataset):
         super().__init__()
@@ -230,7 +240,7 @@ class SetTracker(nn.Module):
             raise FileNotFoundError
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
-        loc_type = torch.device('cpu') if to_cpu else None
+        loc_type = _get_checkpoint_map_location(to_cpu=to_cpu)
         checkpoint = torch.load(filename, map_location=loc_type)
         model_state_disk = checkpoint['model_state']
 
@@ -258,7 +268,7 @@ class SetTracker(nn.Module):
             raise FileNotFoundError
 
         logger.info('==> Loading parameters from checkpoint %s to %s' % (filename, 'CPU' if to_cpu else 'GPU'))
-        loc_type = torch.device('cpu') if to_cpu else None
+        loc_type = _get_checkpoint_map_location(to_cpu=to_cpu)
         checkpoint = torch.load(filename, map_location=loc_type)
         epoch = checkpoint.get('epoch', -1)
         it = checkpoint.get('it', 0.0)

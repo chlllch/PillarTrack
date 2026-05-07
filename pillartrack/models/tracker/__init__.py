@@ -1,5 +1,5 @@
 from .set_tracker import SetTracker
-from .pillartrack import SMAT
+from .smat import SMAT
 
 __all__ = {
     'SetTracker': SetTracker,

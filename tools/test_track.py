@@ -1,20 +1,61 @@
 import argparse
 import datetime
 import glob
+import importlib
 import os
 import re
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter
 
+
+def _enforce_local_pillartrack():
+    """Ensure this script always uses the local repository package."""
+    repo_root = Path(__file__).resolve().parents[1]
+    local_pkg_dir = repo_root / 'pillartrack'
+    if not local_pkg_dir.is_dir():
+        raise RuntimeError(f'Local pillartrack package not found: {local_pkg_dir}')
+
+    repo_root_str = str(repo_root)
+    sys.path = [p for p in sys.path if p != repo_root_str]
+    sys.path.insert(0, repo_root_str)
+
+    # Remove previously loaded pillartrack modules to avoid stale imports.
+    for mod_name in list(sys.modules.keys()):
+        if mod_name == 'pillartrack' or mod_name.startswith('pillartrack.'):
+            sys.modules.pop(mod_name, None)
+
+    config_module = importlib.import_module('pillartrack.config')
+    config_file = Path(config_module.__file__).resolve()
+    if local_pkg_dir not in config_file.parents:
+        raise RuntimeError(
+            f'Environment conflict: pillartrack.config was loaded from {config_file}, '
+            f'expected path under {local_pkg_dir}'
+        )
+
+
+_enforce_local_pillartrack()
+
 from eval_utils import eval_track_utils
 from pillartrack.config import cfg, cfg_from_list, cfg_from_yaml_file, log_config_to_file
 from pillartrack.datasets import build_dataloader
 from pillartrack.models import build_network
 from pillartrack.utils import common_utils
+
+
+def _infer_dataset_cls(cfg_file):
+    cfg_file_lower = cfg_file.lower()
+    if 'kit' in cfg_file_lower:
+        return 'kitti'
+    if 'nus' in cfg_file_lower:
+        return 'nus'
+    return 'waymo'
+
 
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
@@ -56,12 +97,7 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
     model.load_params_from_file(filename=args.ckpt, logger=logger, to_cpu=dist_test)
     model.cuda()
     # start evaluation
-    if 'kit' in args.cfg_file:
-        dataset_cls = 'kitti'
-    elif 'nus' in args.cfg_file:
-        dataset_cls = 'nus'
-    else:
-        dataset_cls = 'waymo'
+    dataset_cls = _infer_dataset_cls(args.cfg_file)
     eval_track_utils.eval_track_one_epoch(
         model, test_loader, epoch_id, logger, dataset_cls, dist_test=dist_test,
         result_dir=eval_output_dir, save_to_file=args.save_to_file, 
@@ -87,6 +123,7 @@ def get_no_evaluated_ckpt(ckpt_dir, ckpt_record_file, args):
 
 
 def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir, dist_test=False):
+    dataset_cls = _infer_dataset_cls(args.cfg_file)
     # evaluated ckpt record
     ckpt_record_file = eval_output_dir / ('eval_list_%s.txt' % cfg.DATA_CONFIG.DATA_SPLIT['test'])
     with open(ckpt_record_file, 'a'):
@@ -121,7 +158,7 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         # start evaluation
         cur_result_dir = eval_output_dir / ('epoch_%s' % cur_epoch_id) / cfg.DATA_CONFIG.DATA_SPLIT['test']
         tb_dict = eval_track_utils.eval_track_one_epoch(
-            model, test_loader, cur_epoch_id, logger, dist_test=dist_test,
+            model, test_loader, cur_epoch_id, logger, dataset_cls, dist_test=dist_test,
             result_dir=cur_result_dir, save_to_file=args.save_to_file
         )
 
